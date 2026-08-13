@@ -7,7 +7,7 @@ MCP endpoint (`/mcp`) and the web admin (`/`).
 ## Install (Windows)
 
 ```bat
-git clone <repo-url> adt-mcp
+git clone https://github.com/NhatPD-VNEXT/ADT-MCP adt-mcp
 cd adt-mcp
 install.bat        REM creates .venv, installs everything, verifies the import
 run.bat            REM starts the server and opens the web admin

@@ -105,7 +105,70 @@ Write (gated by safety, see below):
 - `create_object` (CLAS / INTF / DDLS / DDLX / BDEF / SRVD / SRVB / TABL)
 - `clone_package` (clone toàn bộ object của một package sang package đích, thêm suffix `_VN` + sửa tham chiếu chéo trong source; dry-run mặc định)
 
+Debug (gated by `allow_debug`, see below):
+- `debug_set_breakpoint`, `debug_delete_breakpoint`, `debug_clear_breakpoints`
+- `debug_listen`, `debug_poll`, `debug_stop_listener`
+- `debug_attach`, `debug_detach`
+- `debug_stack`, `debug_variables`, `debug_step`
+- `run_class` (IF_OO_ADT_CLASSRUN — Eclipse's F9)
+
 Cookie maintenance: `refresh_cookies_for`.
+
+## Debugging
+
+The tenant must expose the ADT debugger; check with
+
+```
+GET /sap/bc/adt/compatibility/graph   → COM.SAP.ADT.DEBUGGER :: userRequestDebugging
+```
+
+Enable it per system in `systems.json` — it is **off by default**, separately
+from `allow_write`, because `run_class` executes arbitrary ABAP:
+
+```json
+"allow_debug": true,
+"debug_timeout": 600,
+"debug_listen_seconds": 120
+```
+
+The flow, in order:
+
+```
+debug_set_breakpoint  → statement="…" lets the server find the executable line
+debug_listen          → returns at once; the listener runs in the background
+run_class             → run the code WHILE the listener waits
+debug_poll            → state: listening → caught
+debug_attach
+debug_stack / debug_variables / debug_step
+debug_detach          → releases the debuggee and returns the run's output
+```
+
+`debug_variables` needs explicit names — read the source first. There is no
+working "list what is in scope" call on this platform: `getChildVariables`
+answers with `ME` alone whatever parent it is asked for.
+
+Two things follow from how SAP works, not from choices made here:
+
+- **Run the code while the listener is waiting.** A debuggee is only trapped by
+  a listener that was already registered. `debug_listen` therefore returns
+  immediately instead of blocking.
+- **A breakpoint freezes the HTTP request that started the code.** `run_class`
+  runs in the background for that reason, and the console output only arrives
+  at `debug_detach` (or a later `debug_poll`).
+
+### Cost on cloud
+
+The ABAP session *is* the `SAP_SESSIONID` cookie, so the debugger's isolated
+channels each need their own login. The first `debug_listen` and the first
+`run_class` on a system therefore take ~20–25s while a headless login runs;
+afterwards the sessions are reused. Channel cookies land in
+`cookies/<system>.debug.txt` / `.exec.txt` and are gitignored like the rest.
+
+Breakpoints set here are **external** breakpoints keyed on the ABAP user, so
+leaving one behind would pop the debugger open on a real session later. The
+server deletes everything it set when it shuts down; `debug_clear_breakpoints`
+does it on demand. The `ideId` is `adt-mcp`, distinct from Eclipse's, so your
+IDE breakpoints are never touched.
 
 ## Write safety
 

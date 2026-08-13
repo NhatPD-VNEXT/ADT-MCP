@@ -1,4 +1,5 @@
 """Entry point: `python -m adt_mcp` runs MCP + web admin on one port."""
+import atexit
 import logging
 import os
 
@@ -46,7 +47,20 @@ def main() -> None:
     mcp.settings.host = "127.0.0.1"
     logging.getLogger("adt_mcp").info(
         "ADT MCP on http://127.0.0.1:%s  (MCP at /mcp, admin at /)", port)
-    mcp.run(transport="streamable-http")
+
+    # Shutdown must delete every external breakpoint this server set and release
+    # any debuggee still stopped. A leftover breakpoint pops the debugger open
+    # on the user's real session later; an abandoned debuggee keeps one of the
+    # tenant's work processes. Registered with atexit as well as the finally,
+    # because Ctrl+C on Windows does not always come back through mcp.run().
+    manager = getattr(mcp, "debug_manager", None)
+    if manager is not None:
+        atexit.register(manager.close_all)
+    try:
+        mcp.run(transport="streamable-http")
+    finally:
+        if manager is not None:
+            manager.close_all()
 
 
 if __name__ == "__main__":

@@ -18,6 +18,14 @@ class System:
     allow_write: bool = False
     write_packages: list[str] | None = None
     write_objects: list[str] | None = None
+    # Debugging is gated separately from writing: run_class executes arbitrary
+    # ABAP on the tenant, which outlives any single source change.
+    allow_debug: bool = False
+    # HTTP ceiling while a debug session is live. Code stopped at a breakpoint
+    # holds the request that started it, so this is really "how long may I sit
+    # at a breakpoint before the run is cut loose".
+    debug_timeout: int = 600
+    debug_listen_seconds: int = 120
 
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "System":
@@ -34,13 +42,21 @@ class System:
             allow_write=d.get("allow_write", False),
             write_packages=d.get("write_packages"),
             write_objects=d.get("write_objects"),
+            allow_debug=d.get("allow_debug", False),
+            debug_timeout=int(d.get("debug_timeout", 600)),
+            debug_listen_seconds=int(d.get("debug_listen_seconds", 120)),
         )
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("name")
-        if not d.get("allow_write"):
-            d.pop("allow_write", None)
+        # Only persist flags that were actually turned on / tuned, so a config
+        # written back keeps looking like the one the user wrote by hand.
+        for field, default in (("allow_write", False), ("allow_debug", False),
+                               ("debug_timeout", 600),
+                               ("debug_listen_seconds", 120)):
+            if d.get(field) == default:
+                d.pop(field, None)
         return {k: v for k, v in d.items() if v is not None}
 
 

@@ -8,6 +8,9 @@ from .paths import cookies_dir as _cookies_dir, web_dir as _web_dir
 from .registry import System, SystemRegistry
 from .adt_client import ADTClient
 from .cookie_refresh import refresh_cookies, interactive_login, cdp_capture
+from . import debugger as dbg
+from .debug_pool import DebugError, DebugSessionPool
+from .debug_session import DebugManager
 
 
 def format_systems(systems: list[System]) -> str:
@@ -478,6 +481,291 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
         # Offload to a worker thread like the web-admin routes do.
         return await anyio.to_thread.run_sync(resolve_and_refresh, registry, system)
 
+    # ------------------------------------------------------------------
+    # Debugger. Everything below additionally needs "allow_debug": true on the
+    # system — run_class executes arbitrary ABAP on the tenant, which is a
+    # bigger commitment than any single source write.
+    #
+    # The flow is: debug_set_breakpoint → debug_listen → run_class →
+    # debug_poll → debug_attach → debug_stack / debug_variables / debug_step →
+    # debug_detach.
+    # ------------------------------------------------------------------
+    debug_manager = DebugManager(DebugSessionPool())
+    mcp.debug_manager = debug_manager  # type: ignore[attr-defined]
+
+    def _debug_system(name: str):
+        sys, err = _resolve(name)
+        if err:
+            return None, err
+        if not sys.allow_debug:
+            return None, (f"Error: debugging is off for system {name!r} — set "
+                          f'"allow_debug": true in systems.json')
+        return sys, None
+
+    def _guarded(fn) -> str:
+        """Run one debug step, turning any failure into a readable line.
+
+        An agent drives these in sequence; an exception escaping here would
+        reach it as a bare transport error with no clue which step broke.
+        """
+        try:
+            return fn()
+        except (DebugError, ValueError) as e:
+            text = str(e)
+            return text if text.startswith("Error:") else f"Error: {text}"
+        except Exception as e:  # noqa: BLE001
+            return f"Error: internal {type(e).__name__}: {e}"
+
+    async def _in_thread(fn) -> str:
+        # FastMCP runs sync tools on the event loop thread. These block on SAP
+        # for seconds to minutes, so running them there would freeze the whole
+        # server — including the web admin and every other tool.
+        return await anyio.to_thread.run_sync(lambda: _guarded(fn))
+
+    @tool("debug_set_breakpoint")
+    async def debug_set_breakpoint(system: str, object_type: str, name: str,
+                                   line: int = 0, statement: str = "",
+                                   occurrence: int = 1, condition: str = "",
+                                   function_group: str | None = None) -> str:
+        """Set an external breakpoint. The line must be an EXECUTABLE statement.
+
+        Point at it either way: line=55 if you already know it, or
+        statement="SELECT" to have the server find the line (comments skipped)
+        and report which one it chose; occurrence=2 takes the second match.
+        condition is an ABAP expression, e.g. "lv_i > 3".
+        """
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            target, note = int(line), ""
+            if statement.strip():
+                src = adt.get_source(sys, object_type, name, function_group)
+                if src.startswith("Error:"):
+                    return src
+                target = dbg.locate_statement(src, statement, occurrence)
+                hit = src.split("\n")[target - 1].strip()
+                note = f"\nmatched {statement!r} on line {target}: {hit[:70]}"
+            if target < 1:
+                return ("Error: pass line >= 1, or statement= to let the server "
+                        "find the line")
+            spec = {"kind": "line",
+                    "uri": dbg.breakpoint_uri(object_type, name, target,
+                                              function_group)}
+            if condition.strip():
+                spec["condition"] = condition.strip()
+            user = debug_manager.user(sys)
+            rows = debug_manager.run_control(
+                sys, lambda s: dbg.set_breakpoints(s, [spec], user))
+            # Remembered because there is no list-breakpoints call over REST:
+            # this is the only way shutdown can clean them up, and a forgotten
+            # external breakpoint pops the debugger open on a real session.
+            debug_manager.remember_breakpoints(sys, [r["id"] for r in rows])
+            return dbg.format_breakpoints(rows) + note
+        return await _in_thread(work)
+
+    @tool("debug_delete_breakpoint")
+    async def debug_delete_breakpoint(system: str, breakpoint_id: str) -> str:
+        """Delete a breakpoint by the id debug_set_breakpoint returned."""
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            user = debug_manager.user(sys)
+            debug_manager.run_control(
+                sys, lambda s: dbg.delete_breakpoint(s, breakpoint_id, user))
+            debug_manager.forget_breakpoint(sys, breakpoint_id)
+            return f"OK: deleted breakpoint {breakpoint_id[:60]}"
+        return await _in_thread(work)
+
+    @tool("debug_clear_breakpoints")
+    async def debug_clear_breakpoints(system: str) -> str:
+        """Remove every breakpoint this server set on the system.
+
+        Use it if a run ended badly and you are unsure what is still armed.
+        Breakpoints you set in Eclipse are not affected.
+        """
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            user = debug_manager.user(sys)
+            ids = debug_manager.breakpoint_ids(sys)
+            for ident in ids:
+                try:
+                    debug_manager.run_control(
+                        sys, lambda s, i=ident: dbg.delete_breakpoint(s, i, user))
+                except DebugError:
+                    pass
+                debug_manager.forget_breakpoint(sys, ident)
+            debug_manager.run_control(
+                sys, lambda s: dbg.clear_breakpoints(s, user))
+            return f"OK: cleared {len(ids)} known breakpoint(s) on {sys.name}"
+        return await _in_thread(work)
+
+    @tool("debug_listen")
+    async def debug_listen(system: str, seconds: int = 0) -> str:
+        """Start waiting for a debuggee in the BACKGROUND; returns immediately.
+
+        Returning at once is the point: you must call run_class WHILE the
+        listener is waiting. Then call debug_poll to see whether it caught
+        anything. seconds=0 uses the system's debug_listen_seconds.
+        """
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            wait = int(seconds) or int(sys.debug_listen_seconds)
+            failed = debug_manager.start_listen(sys, seconds=wait)
+            if failed:
+                return failed
+            return (f"OK: listening on {sys.name} for up to {wait}s.\n"
+                    f"→ now call run_class, then debug_poll")
+        return await _in_thread(work)
+
+    @tool("debug_poll")
+    async def debug_poll(system: str) -> str:
+        """Debug session state: idle/listening/caught/attached/timeout/error."""
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            return dbg.format_state(debug_manager.poll(sys))
+        return await _in_thread(work)
+
+    @tool("debug_stop_listener")
+    async def debug_stop_listener(system: str) -> str:
+        """Stop the background listener without releasing an attached debuggee."""
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            debug_manager.stop(sys)
+            return f"OK: listener stopped on {sys.name}"
+        return await _in_thread(work)
+
+    @tool("debug_attach")
+    async def debug_attach(system: str) -> str:
+        """Attach to the debuggee that was caught (see debug_poll)."""
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            failed = debug_manager.attach(sys)
+            if failed:
+                return failed
+            return dbg.format_state(debug_manager.poll(sys))
+        return await _in_thread(work)
+
+    @tool("debug_detach")
+    async def debug_detach(system: str) -> str:
+        """Let the debuggee run to the end and clear the session state.
+
+        Also returns the pending run's output if it finishes in time — this is
+        the only place to collect the output of a run that stopped at a
+        breakpoint.
+        """
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            debug_manager.release(sys)
+            # After the release the code still has to run the part past the
+            # breakpoint before there is any output; give it a moment.
+            out = debug_manager.take_run_output(sys, wait=10.0)
+            done = f"OK: released the debuggee on {sys.name}"
+            if out:
+                return f"{done}\n\nrun output:\n{out}"
+            if debug_manager.is_running(sys):
+                return f"{done}\n(still finishing — call debug_poll for output)"
+            return done
+        return await _in_thread(work)
+
+    @tool("debug_stack")
+    async def debug_stack(system: str) -> str:
+        """Call stack at the current stop."""
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            missing = debug_manager.require_attached(sys)
+            if missing:
+                return missing
+            return dbg.format_stack(
+                debug_manager.run_attached(sys, dbg.get_stack))
+        return await _in_thread(work)
+
+    @tool("debug_variables")
+    async def debug_variables(system: str, names: list[str]) -> str:
+        """Values of named variables at the current stop, e.g. ["lv_total"].
+
+        Names must be given: the tenant has no working "list what is in scope"
+        call. Read the source (get_source) to find them.
+        """
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            missing = debug_manager.require_attached(sys)
+            if missing:
+                return missing
+            return dbg.format_variables(debug_manager.run_attached(
+                sys, lambda s: dbg.get_variables(s, names)))
+        return await _in_thread(work)
+
+    @tool("debug_step")
+    async def debug_step(system: str, step_type: str = "stepOver",
+                         target_uri: str = "") -> str:
+        """Step once: stepInto/stepOver/stepReturn/stepContinue/stepRunToLine/
+        stepJumpToLine. Returns the new call stack."""
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            missing = debug_manager.require_attached(sys)
+            if missing:
+                return missing
+
+            def run(session):
+                dbg.step(session, step_type, target_uri)
+                return dbg.get_stack(session)
+            return dbg.format_stack(debug_manager.run_attached(sys, run))
+        return await _in_thread(work)
+
+    @tool("run_class")
+    async def run_class(system: str, name: str) -> str:
+        """Run a class implementing IF_OO_ADT_CLASSRUN and return its console
+        output (Eclipse's F9). Needs allow_debug.
+
+        Runs in the background on its own session, because a breakpoint stops
+        the very HTTP request that started the class. If it stops, this reports
+        'caught' — call debug_attach next.
+        """
+        def work():
+            sys, err = _debug_system(system)
+            if err:
+                return err
+            limit = debug_manager.exec_timeout(sys)
+            outcome = debug_manager.run_and_wait(
+                sys, lambda s: _guarded(
+                    lambda: dbg.run_class(s, name, timeout=limit)
+                    or "(class finished with no output)"))
+            state = outcome["state"]
+            if state == "done":
+                return outcome["text"]
+            if state == "caught":
+                d = outcome["debuggee"]
+                return (f"caught: {name.upper()} stopped at line {d['line']}\n"
+                        f"{d['uri']}\n→ call debug_attach")
+            if state == "busy":
+                return f"Error: another run is still in flight on {sys.name}"
+            if state == "blocked":
+                return (f"Error: {sys.name} is still stopped at an earlier "
+                        f"debuggee — call debug_detach first")
+            return ("still running — call debug_poll to collect the output "
+                    "(or debug_poll to see whether it hit a breakpoint)")
+        return await _in_thread(work)
+
     @mcp.custom_route("/", methods=["GET"])
     async def index(request: Request) -> HTMLResponse:
         path = os.path.join(_web_dir(), "index.html")
@@ -498,6 +786,14 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
     @mcp.custom_route("/api/systems", methods=["POST"])
     async def api_upsert(request: Request) -> JSONResponse:
         body = await request.json()
+        # The admin form knows nothing about the safety flags, so carry them
+        # over from the stored record. Rebuilding the System from the form
+        # alone would silently switch allow_write/allow_debug back off the
+        # first time somebody edited a URL.
+        try:
+            old = registry.get(body["name"])
+        except KeyError:
+            old = None
         sys = System(
             name=body["name"], url=body["url"],
             client=body.get("client", "001"),
@@ -505,7 +801,13 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
             auth=body.get("auth", "basic"),
             username=body.get("username"), password=body.get("password"),
             cookie_file=body.get("cookie_file"),
-            cookie_string=body.get("cookie_string"))
+            cookie_string=body.get("cookie_string"),
+            allow_write=getattr(old, "allow_write", False),
+            write_packages=getattr(old, "write_packages", None),
+            write_objects=getattr(old, "write_objects", None),
+            allow_debug=getattr(old, "allow_debug", False),
+            debug_timeout=getattr(old, "debug_timeout", 600),
+            debug_listen_seconds=getattr(old, "debug_listen_seconds", 120))
         registry.upsert(sys)
         return JSONResponse({"ok": True})
 

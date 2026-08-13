@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+systems.json
+*-cookies.txt
+.env
+*.egg-info/
+*.log
+cookies/

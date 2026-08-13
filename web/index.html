@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADT MCP — Admin</title>
+<style>
+  :root{
+    --bg:#0f1320; --panel:#171c2e; --panel2:#1e2540; --line:#2a3252;
+    --txt:#e7ebf5; --muted:#9aa6c4; --pri:#5b8cff; --pri2:#3f6fe0;
+    --ok:#34d399; --err:#f87171; --warn:#fbbf24; --radius:14px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+    background:linear-gradient(160deg,#0c1020,#131a30);color:var(--txt);
+    min-height:100vh}
+  header{padding:22px 28px;display:flex;align-items:center;gap:14px;
+    border-bottom:1px solid var(--line)}
+  header .logo{width:40px;height:40px;border-radius:11px;
+    background:linear-gradient(135deg,var(--pri),#9d6bff);
+    display:grid;place-items:center;font-weight:800;font-size:18px;color:#fff;
+    box-shadow:0 6px 18px rgba(91,140,255,.35)}
+  header h1{font-size:18px;margin:0;font-weight:700}
+  header p{margin:2px 0 0;font-size:12.5px;color:var(--muted)}
+  .wrap{max-width:920px;margin:0 auto;padding:26px 22px 60px}
+  .card{background:var(--panel);border:1px solid var(--line);
+    border-radius:var(--radius);padding:18px 20px;margin-bottom:22px;
+    box-shadow:0 10px 30px rgba(0,0,0,.25)}
+  .card h2{margin:0 0 14px;font-size:14px;letter-spacing:.3px;
+    text-transform:uppercase;color:var(--muted)}
+  .sys{display:flex;align-items:center;gap:14px;padding:13px 14px;
+    border:1px solid var(--line);border-radius:12px;background:var(--panel2);
+    margin-bottom:10px}
+  .sys:last-child{margin-bottom:0}
+  .sys .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);
+    flex:none}
+  .sys.ok .dot{background:var(--ok);box-shadow:0 0 10px var(--ok)}
+  .sys.err .dot{background:var(--err);box-shadow:0 0 10px var(--err)}
+  .sys .meta{flex:1;min-width:0}
+  .sys .name{font-weight:700;font-size:15px}
+  .sys .sub{font-size:12.5px;color:var(--muted);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tag{font-size:11px;padding:2px 8px;border-radius:999px;
+    background:#243056;color:var(--pri);border:1px solid #33407a;font-weight:600}
+  .btn{cursor:pointer;font-weight:600;font-size:13px;
+    padding:8px 13px;border-radius:9px;background:var(--panel2);color:var(--txt);
+    border:1px solid var(--line);transition:.15s}
+  .btn:hover{border-color:var(--pri)}
+  .btn.pri{background:linear-gradient(135deg,var(--pri),var(--pri2));
+    border:0;color:#fff;box-shadow:0 6px 16px rgba(63,111,224,.4)}
+  .btn.danger:hover{border-color:var(--err);color:var(--err)}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  .empty{color:var(--muted);font-size:14px;text-align:center;padding:18px}
+  .tabs{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
+  .tab{padding:8px 14px;border-radius:9px;cursor:pointer;font-size:13px;
+    font-weight:600;color:var(--muted);background:var(--panel2);
+    border:1px solid var(--line)}
+  .tab.active{color:#fff;background:linear-gradient(135deg,var(--pri),var(--pri2));
+    border:0}
+  .field{margin-bottom:13px}
+  .field label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:5px}
+  .field input,.field select{width:100%;padding:10px 12px;border-radius:9px;
+    background:#0e1424;border:1px solid var(--line);color:var(--txt);font-size:14px}
+  .field input:focus,.field select:focus{outline:0;border-color:var(--pri)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+  .hint{font-size:12px;color:var(--muted);margin:-4px 0 14px;line-height:1.5}
+  .hide{display:none}
+  #toast{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;
+    gap:10px;z-index:50}
+  .toast{background:var(--panel2);border:1px solid var(--line);
+    border-left:4px solid var(--pri);padding:12px 16px;border-radius:10px;
+    font-size:13.5px;max-width:380px;box-shadow:0 10px 30px rgba(0,0,0,.4);
+    animation:slide .25s ease}
+  .toast.ok{border-left-color:var(--ok)} .toast.err{border-left-color:var(--err)}
+  @keyframes slide{from{transform:translateX(20px);opacity:0}}
+  .spin{width:15px;height:15px;border:2px solid rgba(255,255,255,.3);
+    border-top-color:#fff;border-radius:50%;display:inline-block;
+    animation:rot .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes rot{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">A</div>
+  <div>
+    <h1>ADT MCP — SAP Systems</h1>
+    <p>Multi-system MCP · fetch ABAP source via ADT · local admin (127.0.0.1)</p>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <h2>Configured systems</h2>
+    <div id="systems"></div>
+  </div>
+
+  <div class="card">
+    <h2>Add system</h2>
+    <div class="tabs">
+      <div class="tab active" data-tab="browser">🔐 Browser login</div>
+      <div class="tab" data-tab="headless">⚡ User / Password</div>
+    </div>
+
+    <div class="grid2">
+      <div class="field"><label>Name (id)</label><input id="f-name" placeholder="my-cloud"></div>
+      <div class="field"><label>URL</label><input id="f-url" placeholder="https://myXXXXXX.s4hana.cloud.sap"></div>
+      <div class="field"><label>Client</label><input id="f-client" value="100"></div>
+      <div class="field"><label>Language</label><input id="f-language" value="EN"></div>
+    </div>
+
+    <div id="creds" class="hide">
+      <p class="hint" id="creds-note"></p>
+      <div class="grid2">
+        <div class="field"><label>Username</label><input id="f-user" placeholder="user@domain"></div>
+        <div class="field"><label>Password</label><input id="f-pass" type="password"></div>
+      </div>
+    </div>
+
+    <p class="hint" id="hint"></p>
+    <button class="btn pri" id="submit">Open login window</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+let TAB = 'browser';
+const $ = id => document.getElementById(id);
+
+const HINTS = {
+  browser: "Opens a Chrome window to the URL; log in to IAS there and cookies are captured automatically. No password stored.",
+  headless: "Automatic background login with user/password. Fast, but the password is sent through the form — use on a personal machine only."
+};
+const CREDS_NOTE = {
+  browser: "Optional — saved so Refresh can sign in silently without prompting again.",
+  headless: "Required — used for automatic sign-in."
+};
+
+function toast(msg, kind){
+  const t = document.createElement('div');
+  t.className = 'toast ' + (kind||'');
+  t.textContent = msg;
+  $('toast').appendChild(t);
+  setTimeout(()=>t.remove(), kind==='err'?9000:5000);
+}
+
+const LABELS = {browser:'Open login window', headless:'Log in & save'};
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active'); TAB = t.dataset.tab;
+  const showCreds = TAB==='headless';
+  $('creds').classList.toggle('hide', !showCreds);
+  if(showCreds) $('creds-note').textContent = CREDS_NOTE[TAB];
+  $('submit').textContent = LABELS[TAB];
+  $('hint').textContent = HINTS[TAB];
+});
+$('hint').textContent = HINTS.browser;
+$('submit').textContent = LABELS.browser;
+
+async function load(){
+  const box = $('systems');
+  const { systems } = await (await fetch('/api/systems')).json();
+  if(!systems.length){ box.innerHTML='<div class="empty">No systems yet. Add one below ↓</div>'; return; }
+  box.innerHTML='';
+  for(const s of systems){
+    const el = document.createElement('div');
+    el.className='sys'; el.id='sys-'+s.name;
+    el.innerHTML=`<span class="dot"></span>
+      <div class="meta">
+        <div class="name">${s.name} <span class="tag">${s.auth}</span></div>
+        <div class="sub">${s.url} · client ${s.client} · ${s.language}</div>
+      </div>
+      <div class="row">
+        <button class="btn" data-a="test" data-n="${s.name}">Test</button>
+        <button class="btn" data-a="refresh" data-n="${s.name}">Refresh</button>
+        <button class="btn danger" data-a="del" data-n="${s.name}">Delete</button>
+      </div>`;
+    box.appendChild(el);
+  }
+}
+
+async function call(url, opts, btn){
+  let old; if(btn){ old=btn.textContent; btn.disabled=true; btn.innerHTML='<span class="spin"></span>'+old; }
+  try{ return await (await fetch(url, opts)).json(); }
+  finally{ if(btn){ btn.disabled=false; btn.textContent=old; } }
+}
+
+document.addEventListener('click', async e=>{
+  const b = e.target.closest('button[data-a]'); if(!b) return;
+  const n = b.dataset.n, a = b.dataset.a;
+  if(a==='del'){
+    await fetch('/api/systems/'+n, {method:'DELETE'}); toast('Deleted '+n); load(); return;
+  }
+  if(a==='test'){
+    const r = await call('/api/systems/'+n+'/test', {method:'POST'}, b);
+    const row=$('sys-'+n); const ok=r.result==='OK';
+    row.classList.toggle('ok',ok); row.classList.toggle('err',!ok);
+    toast(n+': '+r.result, ok?'ok':'err'); return;
+  }
+  if(a==='refresh'){
+    toast('Re-authenticating '+n+'…');
+    const r = await call('/api/systems/'+n+'/refresh', {method:'POST'}, b);
+    toast(n+': '+r.result, r.result.startsWith('OK')?'ok':'err'); load(); return;
+  }
+});
+
+$('submit').onclick = async ()=>{
+  const name=$('f-name').value.trim(), url=$('f-url').value.trim();
+  if(!name){ toast('Enter a name', 'err'); return; }
+  const base={ name, url, client:$('f-client').value.trim()||'001',
+               language:$('f-language').value.trim()||'EN' };
+  const btn=$('submit');
+
+  if(!url){ toast('Enter a URL', 'err'); return; }
+  const body={...base, mode:TAB};
+  if(TAB==='headless'){ body.username=$('f-user').value.trim(); body.password=$('f-pass').value; }
+  if(TAB==='browser') toast('Opening login window… sign in to IAS in the new window');
+  const r = await call('/api/systems/login', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}, btn);
+  toast(name+': '+r.result, r.result.startsWith('OK')?'ok':'err');
+  if(r.result.startsWith('OK')) load();
+};
+
+load();
+</script>
+</body>
+</html>

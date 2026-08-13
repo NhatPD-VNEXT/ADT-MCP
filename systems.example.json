@@ -1,0 +1,19 @@
+{
+  "my-cloud": {
+    "url": "https://myXXXXXX.s4hana.cloud.sap",
+    "client": "100",
+    "language": "EN",
+    "auth": "cookie",
+    "cookie_file": "C:\\path\\to\\my-cloud-cookies.txt"
+  },
+  "dev-basic": {
+    "url": "https://dev.example.local:44300",
+    "client": "001",
+    "language": "EN",
+    "auth": "basic",
+    "username": "TESTUSER",
+    "password": "secret",
+    "allow_write": true,
+    "write_packages": ["Z*", "$TMP"]
+  }
+}

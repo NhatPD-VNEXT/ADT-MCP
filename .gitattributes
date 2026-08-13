@@ -1,0 +1,7 @@
+# Later rules win, so the generic one comes first.
+* text=auto
+
+# cmd.exe mis-parses batch files that use bare LF line endings, so force CRLF
+# in every working tree regardless of the machine's core.autocrlf setting.
+*.bat text eol=crlf
+*.cmd text eol=crlf

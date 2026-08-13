@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adt-mcp"
+version = "0.1.0"
+description = "Multi-system MCP server for SAP ABAP source retrieval via ADT"
+requires-python = ">=3.10"
+# mcp is capped below 2.0: that release removed `mcp.server.fastmcp`, which
+# this server is built on. Without the cap a fresh clone installs mcp 2.x and
+# dies at import with ModuleNotFoundError, while an older machine keeps
+# working off its already-installed 1.x.
+# starlette/uvicorn/anyio arrive with mcp, but this code imports them
+# directly - declare them so a fresh install cannot end up without them.
+dependencies = [
+    "mcp>=1.26,<2",
+    "httpx>=0.27",
+    "starlette>=0.27",
+    "uvicorn>=0.23",
+    "anyio>=4.0",
+]
+
+[project.optional-dependencies]
+refresh = ["playwright>=1.40"]
+
+[project.scripts]
+adt-mcp = "adt_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

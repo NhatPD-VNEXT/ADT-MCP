@@ -526,13 +526,20 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
     async def debug_set_breakpoint(system: str, object_type: str, name: str,
                                    line: int = 0, statement: str = "",
                                    occurrence: int = 1, condition: str = "",
-                                   function_group: str | None = None) -> str:
+                                   function_group: str | None = None,
+                                   include: str = "") -> str:
         """Set an external breakpoint. The line must be an EXECUTABLE statement.
 
         Point at it either way: line=55 if you already know it, or
         statement="SELECT" to have the server find the line (comments skipped)
         and report which one it chose; occurrence=2 takes the second match.
         condition is an ABAP expression, e.g. "lv_i > 3".
+
+        include: for a CLAS, put the breakpoint in a class include instead of
+        the main source — definitions | implementations | macros | testclasses.
+        RAP handler code (actions, validations, determinations in lhc_… classes)
+        lives in "implementations"; a behavior pool's main source is an empty
+        shell, so a breakpoint there never fires.
         """
         def work():
             sys, err = _debug_system(system)
@@ -540,7 +547,9 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
                 return err
             target, note = int(line), ""
             if statement.strip():
-                src = adt.get_source(sys, object_type, name, function_group)
+                src = (adt.get_class_include(sys, name, include) if include
+                       else adt.get_source(sys, object_type, name,
+                                           function_group))
                 if src.startswith("Error:"):
                     return src
                 target = dbg.locate_statement(src, statement, occurrence)
@@ -551,7 +560,7 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
                         "find the line")
             spec = {"kind": "line",
                     "uri": dbg.breakpoint_uri(object_type, name, target,
-                                              function_group)}
+                                              function_group, include)}
             if condition.strip():
                 spec["condition"] = condition.strip()
             user = debug_manager.user(sys)

@@ -156,6 +156,40 @@ Two things follow from how SAP works, not from choices made here:
   runs in the background for that reason, and the console output only arrives
   at `debug_detach` (or a later `debug_poll`).
 
+### Debugging a Fiori app (RAP action, determination, validation)
+
+Nothing here runs the code — you do, by clicking in the browser. An external
+breakpoint is keyed on the ABAP *user*, so it traps any session of that user,
+including the OData request the Fiori UI sends.
+
+```
+debug_set_breakpoint  VNEXT CLAS ZBP_I_FLIGHT_013 \
+                      include="implementations" statement="READ ENTITIES"
+debug_listen          VNEXT seconds=600      ← wide enough to switch to the browser
+      … now trigger the action in the Fiori app …
+debug_poll            VNEXT                  → state: caught
+debug_attach / debug_stack / debug_variables / debug_step
+debug_detach          VNEXT                  → the OData request completes
+```
+
+`run_class` plays no part in this flow.
+
+Two things decide whether it works:
+
+- **`include="implementations"`.** RAP handler code (`lhc_…` classes, where
+  actions, determinations and validations live) is in the class's Local Types
+  include. A behavior pool's `/source/main` is an empty shell — a breakpoint
+  there never fires. The returned id shows where it really landed
+  (`…INCLUDE=…CCIMP.LINE_NR=131`).
+- **Same ABAP user.** The Fiori session must run as the user in
+  `/sap/bc/adt/core/http/systeminformation`. A different login is a different
+  user and is never trapped.
+
+While you sit at the breakpoint the OData request is held open, so the Fiori UI
+spins and can hit its own gateway timeout — detach promptly. Leaving a
+breakpoint armed with no listener is not dangerous, though: measured on the
+tenant, the code simply runs straight through.
+
 ### Cost on cloud
 
 The ABAP session *is* the `SAP_SESSIONID` cookie, so the debugger's isolated

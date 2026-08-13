@@ -16,7 +16,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import quoteattr
 
-from .adt_client import object_root_path
+from .adt_client import CLASS_INCLUDES, object_root_path
 from .debug_pool import DISCOVERY, DebugError, DebugSession
 
 ADT = "/sap/bc/adt"
@@ -133,7 +133,24 @@ def locate_statement(source: str, needle: str, occurrence: int = 1) -> int:
 
 
 def breakpoint_uri(object_type: str, name: str, line: int,
-                   function_group: str | None = None) -> str:
+                   function_group: str | None = None,
+                   include: str = "") -> str:
+    """ADT uri of a line, optionally inside a class include.
+
+    `include` matters for RAP: a behavior pool's `/source/main` holds almost
+    nothing — the handler class (`lhc_…`, where actions and validations live)
+    sits in the `implementations` include. Pointing a breakpoint at
+    `/source/main` there sets it on an empty shell that never executes.
+    """
+    if include:
+        inc = include.strip().lower()
+        if inc not in CLASS_INCLUDES:
+            raise ValueError(f"invalid include {include!r}; valid: "
+                             f"{', '.join(sorted(CLASS_INCLUDES))}")
+        if object_type.strip().upper() != "CLAS":
+            raise ValueError("include only applies to object_type CLAS")
+        return (f"{ADT}/oo/classes/{name.strip().upper()}/includes/{inc}"
+                f"#start={int(line)}")
     return f"{object_root_path(object_type, name, function_group)}/source/main" \
            f"#start={int(line)}"
 

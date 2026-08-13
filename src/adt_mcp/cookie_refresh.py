@@ -163,18 +163,46 @@ def _profile_dir() -> str:
     return str(d)
 
 
+def _channel_order() -> tuple:
+    """Which Chromium build to try, in order. Prefer installed channels so it
+    looks/behaves like the user's browser and can use Windows integrated auth
+    / saved passwords. The bundled chromium is last because it only exists if
+    `playwright install` was run, which install.bat deliberately skips.
+    Override with ADT_MCP_BROWSER=msedge|chrome|chromium."""
+    pref = os.environ.get("ADT_MCP_BROWSER", "").strip().lower()
+    return {"msedge": ("msedge",), "chrome": ("chrome",),
+            "chromium": (None,)}.get(pref, ("chrome", "msedge", None))
+
+
+def _no_browser_error(last_err) -> RuntimeError:
+    return RuntimeError(
+        f"could not launch any Chromium browser (tried Chrome, Edge, bundled "
+        f"chromium) — install Chrome/Edge, or run "
+        f"`python -m playwright install chromium`: {last_err}")
+
+
+def _launch_browser(p, headless: bool):
+    """Launch a throwaway browser with the same channel fallback as
+    _open_persistent. Returns the Browser."""
+    last_err = None
+    for channel in _channel_order():
+        try:
+            kwargs = {"headless": headless}
+            if channel:
+                kwargs["channel"] = channel
+            return p.chromium.launch(**kwargs)
+        except Exception as e:
+            last_err = e
+            continue
+    raise _no_browser_error(last_err)
+
+
 def _open_persistent(p, headless: bool, timeout_ms: int):
-    """Launch the user's installed browser (Edge → Chrome → bundled Chromium)
+    """Launch the user's installed browser (Chrome → Edge → bundled Chromium)
     with a persistent profile. Returns the BrowserContext."""
     user_data_dir = _profile_dir()
     last_err = None
-    # Prefer installed channels so it looks/behaves like the user's browser
-    # and can use Windows integrated auth / saved passwords. Chrome first
-    # (override with ADT_MCP_BROWSER=msedge|chrome|chromium).
-    pref = os.environ.get("ADT_MCP_BROWSER", "").strip().lower()
-    order = {"msedge": ("msedge",), "chrome": ("chrome",),
-             "chromium": (None,)}.get(pref, ("chrome", "msedge", None))
-    for channel in order:
+    for channel in _channel_order():
         try:
             kwargs = {"user_data_dir": user_data_dir, "headless": headless,
                       "args": ["--no-first-run", "--no-default-browser-check"]}
@@ -186,7 +214,7 @@ def _open_persistent(p, headless: bool, timeout_ms: int):
         except Exception as e:
             last_err = e
             continue
-    raise RuntimeError(f"could not launch any browser: {last_err}")
+    raise _no_browser_error(last_err)
 
 
 def interactive_login(url: str, cookie_file: str,
@@ -291,7 +319,7 @@ def refresh_cookies(url: str, username: str, password: str, cookie_file: str,
     target_host = url.split("//", 1)[1].split("/", 1)[0]
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless)
+            browser = _launch_browser(p, headless)
             context = browser.new_context()
             page = context.new_page()
             page.set_default_timeout(timeout_ms)

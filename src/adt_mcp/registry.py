@@ -83,7 +83,14 @@ class SystemRegistry:
         return list(self._systems.values())
 
     def get(self, name: str) -> System:
-        return self._systems[name]
+        try:
+            return self._systems[name]
+        except KeyError:
+            wanted = name.casefold()
+            for stored_name, system in self._systems.items():
+                if stored_name.casefold() == wanted:
+                    return system
+            raise
 
     def upsert(self, system: System) -> None:
         self._systems[system.name] = system

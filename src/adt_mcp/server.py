@@ -1,5 +1,11 @@
 """FastMCP server wiring registry + ADT client into MCP tools."""
+import functools
+import inspect
+import logging
 import os
+import re
+import threading
+import time
 import anyio
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
@@ -11,6 +17,8 @@ from .cookie_refresh import refresh_cookies, interactive_login, cdp_capture
 from . import debugger as dbg
 from .debug_pool import DebugError, DebugSessionPool
 from .debug_session import DebugManager
+
+_log = logging.getLogger("adt_mcp")
 
 
 def format_systems(systems: list[System]) -> str:
@@ -63,6 +71,92 @@ def resolve_and_refresh(registry: SystemRegistry, system: str) -> str:
     return refresh_cookies(sys.url, sys.username, sys.password, sys.cookie_file)
 
 
+# A POST whose CSRF token is still rejected after a fresh fetch means the
+# session behind the token is gone: the discovery call got a login page and no
+# token. The failing request wrote nothing, so a retry after re-login is safe.
+_EXPIRED = re.compile(r"session expired|cookie expired|cookie/session expired"
+                      r"|csrf token validation failed", re.IGNORECASE)
+
+
+def looks_expired(result) -> bool:
+    """True if a tool result is the 'SAP session is gone' error."""
+    return (isinstance(result, str) and result.startswith("Error:")
+            and _EXPIRED.search(result) is not None)
+
+
+class SessionKeeper:
+    """Re-login cookie systems whose SAP session has expired.
+
+    SAP drops an idle cookie session, and every call then fails until someone
+    runs refresh_cookies_for. For systems with stored credentials this is done
+    here instead: probe before a call once the system has been idle, and retry
+    a call once if it still reports an expired session.
+    """
+    IDLE_SECONDS = 300
+
+    def __init__(self, registry: SystemRegistry, adt: ADTClient,
+                 refresh=None, clock=time.monotonic):
+        self.registry = registry
+        self.adt = adt
+        self._refresh = refresh or (
+            lambda s: resolve_and_refresh(registry, s.name))
+        self._clock = clock
+        self._last_used: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def can_refresh(s: System) -> bool:
+        return (s.auth == "cookie"
+                and bool(s.cookie_file and s.username and s.password))
+
+    def refresh(self, s: System) -> str:
+        # Playwright's sync API refuses to start on a thread that runs an
+        # asyncio loop, and FastMCP calls sync tools on the loop thread.
+        box: dict[str, str] = {}
+
+        def work():
+            try:
+                box["result"] = self._refresh(s)
+            except Exception as e:  # noqa: BLE001
+                box["result"] = f"Error: refresh crashed: {e}"
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        t.join()
+        result = box.get("result", "Error: refresh returned nothing")
+        _log.info("auto refresh cookies for %s: %s", s.name, result)
+        return result
+
+    def call(self, system: str, fn):
+        try:
+            s = self.registry.get(system)
+        except KeyError:
+            return fn()
+        if not self.can_refresh(s):
+            return fn()
+        refreshed = None
+        with self._lock:
+            last = self._last_used.get(s.name)
+            if last is None or self._clock() - last > self.IDLE_SECONDS:
+                status = self.adt.test_connection(s)
+                if (status.startswith("Error: session expired")
+                        or status.startswith("Error: auth failed")):
+                    refreshed = self.refresh(s)
+            self._last_used[s.name] = self._clock()
+        result = fn()
+        if looks_expired(result):
+            # One login attempt per call: a login that just failed will not
+            # work a few seconds later either.
+            if refreshed is None:
+                with self._lock:
+                    refreshed = self.refresh(s)
+                if refreshed.startswith("OK"):
+                    result = fn()
+            if looks_expired(result) and not refreshed.startswith("OK"):
+                return f"{result}\n(auto refresh failed: {refreshed})"
+        self._last_used[s.name] = self._clock()
+        return result
+
+
 CORE_TOOLS = {
     "list_systems", "check_connection", "list_package", "search_objects",
     "get_source",
@@ -74,7 +168,10 @@ CORE_TOOLS = {
 
 
 def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
-    mcp = FastMCP("adt-mcp", host="127.0.0.1")
+    # Tools do not depend on MCP transport state. Stateless mode lets clients
+    # keep working after this process restarts even if they send an old
+    # Mcp-Session-Id.
+    mcp = FastMCP("adt-mcp", host="127.0.0.1", stateless_http=True)
     mcp.registry = registry  # type: ignore[attr-defined]
     mcp.adt = adt            # type: ignore[attr-defined]
 
@@ -82,10 +179,23 @@ def build_server(registry: SystemRegistry, adt: ADTClient) -> FastMCP:
     # always-on tool schema is ~40% smaller. Default "full" loads everything.
     mode = os.environ.get("ADT_MCP_TOOLS", "full").lower()
     enabled = CORE_TOOLS if mode == "core" else None  # None = all
+    keeper = SessionKeeper(registry, adt)
+    mcp.session_keeper = keeper  # type: ignore[attr-defined]
 
     def tool(name: str):
         def deco(fn):
-            return mcp.tool()(fn) if (enabled is None or name in enabled) else fn
+            if enabled is not None and name not in enabled:
+                return fn
+            target = fn
+            # Sync tools that take a system go through the keeper, so an
+            # expired cookie session is renewed without a manual refresh.
+            # Async tools (debugger, refresh_cookies_for) manage their own.
+            if ("system" in inspect.signature(fn).parameters
+                    and not inspect.iscoroutinefunction(fn)):
+                @functools.wraps(fn)
+                def target(**kwargs):
+                    return keeper.call(kwargs["system"], lambda: fn(**kwargs))
+            return mcp.tool()(target)
         return deco
 
     @tool("list_systems")

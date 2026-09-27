@@ -163,23 +163,78 @@ def parse_adt_exception(data: bytes) -> tuple[str, str]:
     return type_id, message
 
 
-def parse_activation(data: bytes) -> str:
-    """Return 'OK' or an error string from an activation response."""
+def parse_activation_messages(data: bytes) -> list[dict]:
+    """Parse an activation response into message dicts {type, text, line, obj}.
+
+    ADT reports each message as
+    <msg type="E" line="1" objDescr="Table ZT" href="...#start=65,32">
+      <shortText><txt>LINENO is a reserved word</txt></shortText></msg>
+    The text lives in the <txt> child, not in an attribute.
+    """
     if not data:
-        return "OK"
+        return []
     try:
         root = ET.fromstring(data)
     except ET.ParseError:
-        return "OK"
-    errors = []
+        return []
+    out = []
     for el in root.iter():
-        if _localname(el.tag) in ("msg", "message"):
-            a = {_localname(k): v for k, v in el.attrib.items()}
-            sev = (a.get("severity") or a.get("type") or "").upper()
-            text = a.get("shortText") or (el.text or "")
-            if sev and sev[0] in ("E", "A", "X"):
-                errors.append(text.strip() or sev)
-    return "Error: activation failed: " + "; ".join(errors) if errors else "OK"
+        if _localname(el.tag) not in ("msg", "message"):
+            continue
+        a = {_localname(k): v for k, v in el.attrib.items()}
+        texts = [(t.text or "").strip() for t in el.iter()
+                 if _localname(t.tag) == "txt"]
+        text = (" ".join(t for t in texts if t) or a.get("shortText", "")
+                or (el.text or "")).strip()
+        # The source position is in href (#start=6,13). The line attribute is
+        # not reliable: for DDIC objects it is the message's index in the log.
+        m = re.search(r"start=(\d+)", a.get("href", ""))
+        line = m.group(1) if m else a.get("line", "")
+        if line == "0":
+            line = ""
+        out.append({
+            "type": (a.get("type") or a.get("severity") or "").upper(),
+            "text": text,
+            "line": line,
+            "obj": a.get("objDescr", ""),
+        })
+    return out
+
+
+def format_activation_message(m: dict) -> str:
+    loc = f":{m['line']}" if m["line"] else ""
+    obj = f" [{m['obj']}]" if m["obj"] else ""
+    return f"- {m['type'] or '?'}{loc}{obj}: {m['text'] or '(no message text)'}"
+
+
+def parse_activation(data: bytes) -> str:
+    """Return 'OK', 'OK with N warning(s): ...' or an error string listing the
+    activation log (errors first, then warnings)."""
+    msgs = parse_activation_messages(data)
+    errors = [m for m in msgs if m["type"][:1] in ("E", "A", "X")]
+    warnings = [m for m in msgs if m["type"][:1] == "W"]
+    if errors:
+        lines = [f"Error: activation failed ({len(errors)} error(s), "
+                 f"{len(warnings)} warning(s)):"]
+        lines += [format_activation_message(m) for m in errors + warnings]
+        return "\n".join(lines)
+    if warnings:
+        lines = [f"OK with {len(warnings)} warning(s):"]
+        lines += [format_activation_message(m) for m in warnings]
+        return "\n".join(lines)
+    return "OK"
+
+
+def saved_then_activated(result: str, what: str) -> str:
+    """Wrap an activate() result that follows a successful source write.
+
+    The source is already stored at this point, so a failed activation leaves
+    an inactive version on the server — say that instead of a bare error.
+    """
+    if result.startswith("Error: "):
+        return (f"Error: {what} source saved, but it is NOT active — "
+                f"{result[len('Error: '):]}")
+    return result
 
 
 def parse_check_run(data: bytes) -> list[dict]:
@@ -1084,6 +1139,11 @@ class ADTClient:
         # extra discovery round-trip on every POST. Invalidated on a 403 that
         # asks for a fresh token (x-csrf-token: Required).
         self._csrf_cache: dict[str, str] = {}
+        self._cookie_seed_fingerprints: dict[str, tuple[tuple[str, str], ...]] = {}
+
+    @staticmethod
+    def _csrf_key(system: System) -> str:
+        return f"{system.name}:{base_url(system.url)}"
 
     def source_url(self, system: System, object_type: str, name: str,
                    function_group: str | None) -> str:
@@ -1120,12 +1180,7 @@ class ADTClient:
 
     def _auth_kwargs(self, system: System) -> dict:
         if system.auth == "cookie":
-            if system.cookie_string:
-                return {"headers": {"Cookie": system.cookie_string}}
-            if system.cookie_file:
-                with open(system.cookie_file, encoding="utf-8") as f:
-                    cookies = parse_netscape_cookies(f.read())
-                return {"headers": {"Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}}
+            self._prime_cookies(system)
             return {}
         return {"auth": httpx.BasicAuth(system.username or "",
                                         system.password or "")}
@@ -1142,11 +1197,11 @@ class ADTClient:
 
         force=True bypasses the cache (e.g. after the server rejected a token).
         """
-        key = base_url(system.url)
+        kwargs = self._auth_kwargs(system)
+        key = self._csrf_key(system)
         if not force and key in self._csrf_cache:
             return self._csrf_cache[key]
-        url = f"{key}/sap/bc/adt/discovery"
-        kwargs = self._auth_kwargs(system)
+        url = f"{base_url(system.url)}/sap/bc/adt/discovery"
         headers = kwargs.pop("headers", {})
         headers["X-CSRF-Token"] = "fetch"
         headers["Accept"] = "application/atomsvc+xml"
@@ -1162,8 +1217,11 @@ class ADTClient:
     @staticmethod
     def _csrf_rejected(resp) -> bool:
         """True if the server rejected the CSRF token and wants a fresh one."""
-        return (resp.status_code == 403
-                and resp.headers.get("x-csrf-token", "").lower() == "required")
+        if resp.status_code != 403:
+            return False
+        if resp.headers.get("x-csrf-token", "").lower() == "required":
+            return True
+        return "csrf token validation failed" in resp.text.lower()
 
     def _post_once(self, system: System, url: str, accept: str, token: str,
                    body: bytes | None, content_type: str | None):
@@ -1524,9 +1582,43 @@ class ADTClient:
         except ValueError as e:
             return f"Error: {e}"
         if source is None:
-            source = self.get_source(system, object_type, name, function_group)
+            try:
+                src_url = self.source_url(system, object_type, name,
+                                          function_group)
+            except ValueError as e:
+                return f"Error: {e}"
+            if version == "inactive":
+                src_url += "&version=inactive"
+            source = self._fetch_source(system, src_url,
+                                        f"{object_type} {name}")
             if source.startswith("Error:"):
                 return source
+            checked = f"checked the stored {version} source"
+        else:
+            checked = (f"checked the source passed in "
+                       f"({len(source.splitlines())} lines)")
+        msgs = self._check_messages(system, root_path, version, source)
+        if isinstance(msgs, str):
+            return msgs
+        errors = [m for m in msgs if m["type"][:1] in ("E", "A", "X")]
+        warnings = [m for m in msgs if m["type"][:1] == "W"]
+        if not errors and not warnings:
+            return (f"OK: no syntax errors ({object_type.upper()} "
+                    f"{name.upper()}) — {checked}")
+
+        def fmt(m: dict) -> str:
+            loc = f":{m['line']}" if m["line"] else ""
+            return f"{m['type']}{loc}: {m['text']}"
+
+        lines = [f"{len(errors)} error(s), {len(warnings)} warning(s) "
+                 f"in {object_type.upper()} {name.upper()} — {checked}:"]
+        lines += [fmt(m) for m in errors + warnings]
+        return "\n".join(lines)
+
+    def _check_messages(self, system: System, root_path: str, version: str,
+                        source: str) -> list[dict] | str:
+        """POST one check-run with `source` as the artifact; return the
+        parsed messages, or an error string."""
         artifact_uri = f"{root_path}/source/main"
         encoded = base64.b64encode(source.encode("utf-8")).decode("ascii")
         body = (
@@ -1558,19 +1650,31 @@ class ADTClient:
         if is_login_page(resp):
             return (f"Error: session expired for system {system.name!r} "
                     f"— refresh cookies and retry")
-        msgs = parse_check_run(resp.content)
-        errors = [m for m in msgs if m["type"][:1] in ("E", "A", "X")]
+        return parse_check_run(resp.content)
+
+    def _warnings_after_activation(self, system: System, object_type: str,
+                                   name: str, function_group: str | None,
+                                   source: str) -> str:
+        """'OK' or 'OK with N warning(s): ...' from a check-run of the source
+        just activated.
+
+        Activation logs on the tenant carry errors but can leave out warnings
+        (e.g. a DDIC key that should be inverted individual, RC 4), so a clean
+        activation is followed by one check-run to surface them. A failed
+        check-run is not an error here: the object is already active.
+        """
+        try:
+            root_path = object_root_path(object_type, name, function_group)
+        except ValueError:
+            return "OK"
+        msgs = self._check_messages(system, root_path, "active", source)
+        if isinstance(msgs, str):
+            return "OK"
         warnings = [m for m in msgs if m["type"][:1] == "W"]
-        if not errors and not warnings:
-            return f"OK: no syntax errors ({object_type.upper()} {name.upper()})"
-
-        def fmt(m: dict) -> str:
-            loc = f":{m['line']}" if m["line"] else ""
-            return f"{m['type']}{loc}: {m['text']}"
-
-        lines = [f"{len(errors)} error(s), {len(warnings)} warning(s) "
-                 f"in {object_type.upper()} {name.upper()}:"]
-        lines += [fmt(m) for m in errors + warnings]
+        if not warnings:
+            return "OK"
+        lines = [f"OK with {len(warnings)} warning(s):"]
+        lines += [format_activation_message({**m, "obj": ""}) for m in warnings]
         return "\n".join(lines)
 
     # --- Pretty printer (ABAP source formatter) ---
@@ -2298,9 +2402,16 @@ class ADTClient:
         per-request override) so a session-id the server rotates mid-sequence
         (Set-Cookie on LOCK) is carried into the following PUT/UNLOCK."""
         host = urlsplit(base_url(system.url)).hostname or ""
+        cookies = self._cookies_dict(system) or {}
+        fingerprint = tuple(sorted(cookies.items()))
+        key = self._csrf_key(system)
+        if self._cookie_seed_fingerprints.get(key) == fingerprint:
+            return
         jar = self._client.cookies
-        for k, v in (self._cookies_dict(system) or {}).items():
+        for k, v in cookies.items():
             jar.set(k, v, domain=host)
+        self._cookie_seed_fingerprints[key] = fingerprint
+        self._csrf_cache.pop(key, None)
 
     def _write_kwargs(self, system: System) -> dict:
         """Auth kwargs for the stateful write sequence.
@@ -2325,6 +2436,12 @@ class ADTClient:
             resp = self._client.post(url, headers=headers, **wk)
         except httpx.HTTPError as e:
             return "", f"Error: lock request failed: {e}"
+        if self._csrf_rejected(resp):
+            headers["X-CSRF-Token"] = self._csrf_token(system, force=True)
+            try:
+                resp = self._client.post(url, headers=headers, **wk)
+            except httpx.HTTPError as e:
+                return "", f"Error: lock retry failed: {e}"
         if resp.status_code != 200:
             exc_type, msg = parse_adt_exception(resp.content)
             # ExceptionResourceNoAccess / ...AlreadyLocked on LOCK means the
@@ -2346,6 +2463,10 @@ class ADTClient:
                     f"retry.{detail}")
             detail = msg or resp.text[:300]
             return "", f"Error: lock failed (HTTP {resp.status_code}): {detail}"
+        if is_login_page(resp):
+            return "", (f"Error: session expired for system {system.name!r} "
+                        f"(got SAML login page on lock) — refresh cookies and "
+                        f"retry")
         handle, _mod = parse_lock_result(resp.content)
         # Note: MODIFICATION_SUPPORT="NoModification" is informational on cloud
         # (local / no version mgmt) and does NOT block writes — a PUT with the
@@ -2367,6 +2488,13 @@ class ADTClient:
                                     content=source.encode("utf-8"), **wk)
         except httpx.HTTPError as e:
             return f"Error: update request failed: {e}"
+        if self._csrf_rejected(resp):
+            headers["X-CSRF-Token"] = self._csrf_token(system, force=True)
+            try:
+                resp = self._client.put(
+                    url, headers=headers, content=source.encode("utf-8"), **wk)
+            except httpx.HTTPError as e:
+                return f"Error: update retry failed: {e}"
         if resp.status_code in (200, 201, 202):
             if is_login_page(resp):
                 return (f"Error: session expired for system {system.name!r} "
@@ -2386,6 +2514,9 @@ class ADTClient:
         headers = {"X-sap-adt-sessiontype": "stateful", "X-CSRF-Token": token}
         try:
             resp = self._client.post(url, headers=headers, **wk)
+            if self._csrf_rejected(resp):
+                headers["X-CSRF-Token"] = self._csrf_token(system, force=True)
+                resp = self._client.post(url, headers=headers, **wk)
             return resp.status_code in (200, 202, 204)
         except httpx.HTTPError:
             return False
@@ -2408,8 +2539,16 @@ class ADTClient:
             resp = self._post(system, url, "application/xml", body, "application/xml")
         except httpx.HTTPError as e:
             return f"Error: activate request failed: {e}"
+        return self._activation_result(system, resp)
+
+    def _activation_result(self, system: System, resp) -> str:
         if resp.status_code not in (200, 202):
             return f"Error: activate failed (HTTP {resp.status_code}): {resp.text[:200]}"
+        # An expired session answers 200 with an HTML login page, which does
+        # not parse as XML and would otherwise read as a clean activation.
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"(got SAML login page) — refresh cookies and retry")
         return parse_activation(resp.content)
 
     def activate_many(self, system: System,
@@ -2440,10 +2579,7 @@ class ADTClient:
                               body, "application/xml")
         except httpx.HTTPError as e:
             return f"Error: activate request failed: {e}"
-        if resp.status_code not in (200, 202):
-            return (f"Error: activate failed (HTTP {resp.status_code}): "
-                    f"{resp.text[:200]}")
-        return parse_activation(resp.content)
+        return self._activation_result(system, resp)
 
     def object_package(self, system: System, object_type: str,
                        name: str, function_group: str | None = None) -> str | None:
@@ -2467,6 +2603,32 @@ class ADTClient:
                 if a.get("name"):
                     return a["name"]
         return None
+
+    def package_abap_language_version(self, system: System,
+                                      package: str) -> str:
+        """Return the backend-preferred ABAP language version for a package."""
+        package_path = f"/sap/bc/adt/packages/{quote(package.lower(), safe='')}"
+        url = (f"{base_url(system.url)}/sap/bc/adt/repository/"
+               f"informationsystem/abaplanguageversions"
+               f"?uri={quote(package_path, safe='')}")
+        try:
+            resp = self._get(
+                system, url, "application/vnd.sap.adt.nameditems.v1+xml")
+        except httpx.HTTPError:
+            return "cloudDevelopment"
+        if resp.status_code != 200 or is_login_page(resp):
+            return "cloudDevelopment"
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError:
+            return "cloudDevelopment"
+        for item in root.iter():
+            if _localname(item.tag) != "namedItem":
+                continue
+            for child in item:
+                if _localname(child.tag) == "name" and (child.text or "").strip():
+                    return (child.text or "").strip()
+        return "cloudDevelopment"
 
     def _edit_sequence(self, system: System, root_url: str, source_url: str,
                        source: str, transport: str | None) -> str | None:
@@ -2504,7 +2666,13 @@ class ADTClient:
         if err:
             return err
         if activate:
-            return self.activate(system, object_type, name, function_group)
+            res = saved_then_activated(
+                self.activate(system, object_type, name, function_group),
+                f"{object_type.upper()} {name.upper()}")
+            if res == "OK":
+                res = self._warnings_after_activation(
+                    system, object_type, name, function_group, source)
+            return res
         return f"OK: updated {object_type.upper()} {name.upper()} (not activated)"
 
     def update_class_include(self, system: System, class_name: str,
@@ -2532,7 +2700,9 @@ class ADTClient:
         if err:
             return err
         if activate:
-            return self.activate(system, "CLAS", class_name)
+            return saved_then_activated(
+                self.activate(system, "CLAS", class_name),
+                f"CLAS {class_name.upper()} include {inc}")
         return f"OK: updated {class_name.upper()} include {inc} (not activated)"
 
     # --- Write: create (v_write Phase B) ---
@@ -2556,9 +2726,12 @@ class ADTClient:
         # it isn't a valid XUBNAME (e.g. an IAS email) and lets the server fill
         # it from the session user.
         responsible = (system.username or "").upper()
+        abap_language_version = self.package_abap_language_version(
+            system, package)
         body = build_creation_body(ot, name, package, description, responsible,
                                    service_definition, binding_version,
-                                   language=system.language)
+                                   language=system.language,
+                                   abap_language_version=abap_language_version)
         # Pin sap-language on the create URL so SAP writes the description in
         # system.language, matching adtcore:masterLanguage in the body. Without
         # it the description is written in the *session logon language*, which
@@ -2577,9 +2750,23 @@ class ADTClient:
             return f"Error: create request failed: {e}"
         if resp.status_code not in (200, 201):
             return f"Error: create failed (HTTP {resp.status_code}): {resp.text[:300]}"
+        if is_login_page(resp):
+            return (f"Error: session expired for system {system.name!r} "
+                    f"(got SAML login page) — object was NOT created; refresh "
+                    f"cookies and retry")
+        created = f"{ot} {name.upper()} in {package.upper()}"
         if source and source_capable:
-            return self.update_source(system, ot, name, source, transport)
-        return f"OK: created {ot} {name.upper()} in {package.upper()}"
+            res = self.update_source(system, ot, name, source, transport)
+            if res.startswith("Error: "):
+                # The object exists from here on. Say so, or the caller retries
+                # create_object and hits "already exists".
+                return (f"Error: created {created}, but writing its source "
+                        f"failed. The object EXISTS now — fix it with "
+                        f"update_source, do not call create_object again.\n"
+                        f"{res[len('Error: '):]}")
+            # res is "OK" or "OK with N warning(s): ..."
+            return f"OK: created {created}{res[2:]}"
+        return f"OK: created {created}"
 
     def clone_package(self, source: System, target: System,
                       source_package: str, target_package: str,
